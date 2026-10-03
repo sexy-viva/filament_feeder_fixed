@@ -10,11 +10,12 @@
 // 5. Improved readDebounced() with proper state machine
 // 6. Better error handling in STALL_RETRACT
 // 7. Optimized String usage in web handlers
-// 8. Fixed ADC noise filtering with moving average
+// 8. Improved ADC noise filtering with moving average
 // 9. Safer Hall calibration with hysteresis
 // 10. Motor independence in rampMotor() logic
+// 11. MANUAL Hall calibration via Web API
 // ============================================================================
-// Requires libraries: TMCStepper (teemuatlut), Adafruit NeoPixel
+// Requires libraries: TMCStepper (teemuatlut), Adafruit NeoPixel, ArduinoJson
 // ============================================================================
 
 #include <TMCStepper.h>
@@ -23,6 +24,7 @@
 #include <WebServer.h>
 #include <Adafruit_NeoPixel.h>
 #include <ESPmDNS.h>
+#include <ArduinoJson.h>
 #include <time.h>
 #include <sys/time.h>
 #include <freertos/FreeRTOS.h>
@@ -101,8 +103,7 @@ Preferences prefs;
 Adafruit_NeoPixel rgbLed(RGB_LED_COUNT, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 
 enum SystemState {
-  ST_INIT, ST_WAIT_LOAD, ST_CAL_WAIT_EMPTY1, ST_CAL_WAIT_MAX,
-  ST_CAL_WAIT_EMPTY2, ST_AUTOLOAD, ST_RUN, ST_SPLICE_WAIT,
+  ST_INIT, ST_WAIT_LOAD, ST_CAL_MANUAL, ST_AUTOLOAD, ST_RUN, ST_SPLICE_WAIT,
   ST_SPLICE_FEED, ST_STALL_RETRACT, ST_FAULT
 };
 
@@ -117,10 +118,10 @@ float piIntegral = 0;
 unsigned long lastFeedChangeMs = 0;
 long lastHallForWatchdog = 0;
 
-// FIX #1: Per-motor ramp timers (was global lastRampUs)
+// Per-motor ramp timers
 unsigned long lastRampUs[3] = {0, 0, 0};
 
-// FIX #8: Moving average buffer for Hall ADC noise filtering
+// Moving average buffer for Hall ADC noise filtering
 int hallAdcBuffer[HALL_FILTER_AVG];
 int hallAdcIndex = 0;
 
@@ -132,7 +133,7 @@ bool endstopEmptyPending = false, endstopMaxPending = false;
 int stallRetryCount = 0;
 long stallRetractStepsRemaining = 0;
 bool stallWasForward = true;
-unsigned long stallRetractStartedMs = 0;  // FIX #6: Timeout for stall retract
+unsigned long stallRetractStartedMs = 0;
 
 float motorCurSpeed[3] = {0, 0, 0};
 
@@ -140,6 +141,10 @@ bool wifiConnected = false;
 
 char faultReason[64] = "";
 bool calibrationNeeded = false;
+
+// MANUAL calibration mode variables
+bool manualCalMode = false;  // Are we in manual calibration mode?
+int manualMotorSelect = 0;   // Which motor is being calibrated (1 or 2)
 
 const char* ssid = "VODkA";
 const char* password = "88888888";
@@ -189,8 +194,8 @@ String getLogSnapshot() {
 }
 
 const char* stateToString(SystemState s) {
-  static const char* states[] = {"INIT","WAIT_LOAD","CAL_WAIT_EMPTY1","CAL_WAIT_MAX","CAL_WAIT_EMPTY2","AUTOLOAD","RUN","SPLICE_WAIT","SPLICE_FEED","STALL_RETRACT","FAULT"};
-  if (s >= 0 && s <= 10) return states[s];
+  static const char* states[] = {"INIT","WAIT_LOAD","CAL_MANUAL","AUTOLOAD","RUN","SPLICE_WAIT","SPLICE_FEED","STALL_RETRACT","FAULT"};
+  if (s >= 0 && s <= 8) return states[s];
   return "UNKNOWN";
 }
 
@@ -218,7 +223,7 @@ void motorPulseIfDue(int m) {
   }
 }
 
-// FIX #1: Per-motor ramp timers
+// Per-motor ramp timers
 void rampMotor(int m, float targetSps) {
   unsigned long now = micros();
   float dt = (lastRampUs[m] == 0) ? 0.001f : (now - lastRampUs[m]) / 1000000.0f;
@@ -231,7 +236,7 @@ void rampMotor(int m, float targetSps) {
   motorCurSpeed[m] = cur;
 }
 
-// FIX #8: Moving average Hall ADC filtering
+// Moving average Hall ADC filtering
 int readHallAveraging(int raw) {
   hallAdcBuffer[hallAdcIndex] = raw;
   hallAdcIndex = (hallAdcIndex + 1) % HALL_FILTER_AVG;
@@ -255,7 +260,7 @@ bool hallHardwareFaulted(int raw) {
   return badStreak >= HALL_FAULT_STREAK_REQUIRED;
 }
 
-// FIX #5: Improved debouncing with proper state machine
+// Improved debouncing with proper state machine
 bool readDebounced(int pin, bool &stateVar, unsigned long &changedAt, bool &pending) {
   bool raw = (digitalRead(pin) == LOW);
   
@@ -326,6 +331,7 @@ void clearFault() {
   motorHold(1); 
   motorHold(2); 
   activeMotor = 0;
+  manualCalMode = false;
   addLog("Аварію скинуто користувачем");
   state = ST_INIT;
 }
@@ -335,7 +341,7 @@ uint16_t adaptiveStallThreshold(float stepsPerSec) {
   return (uint16_t)(60 + ratio * 60);
 }
 
-// FIX #3: Better StallGuard logic
+// Better StallGuard logic
 bool checkStall(int m, float currentSpeed) {
   if (currentSpeed < 1.0f) return false;
   
@@ -359,7 +365,7 @@ bool checkStall(int m, float currentSpeed) {
   stallReturnState = state;
   stallRetractStepsRemaining = (long)STALL_RETRACT_MM * STEPS_PER_MM;
   stallWasForward = (digitalRead(m == 1 ? M1_DIR_PIN : M2_DIR_PIN) == HIGH);
-  stallRetractStartedMs = millis();  // FIX #6: Start timeout
+  stallRetractStartedMs = millis();
   motorDir(m, !stallWasForward);
   state = ST_STALL_RETRACT;
   return true;
@@ -399,13 +405,10 @@ void updateStatusLED() {
     case ST_FAULT: 
       color = blinkOn ? rgbLed.Color(120, 0, 0) : rgbLed.Color(0, 0, 0); 
       break;
-    case ST_CAL_WAIT_EMPTY1: 
-    case ST_CAL_WAIT_MAX: 
-    case ST_CAL_WAIT_EMPTY2: 
+    case ST_CAL_MANUAL: 
       color = rgbLed.Color(0, 80, 80); 
       break;
     case ST_AUTOLOAD: 
-    case ST_SPLICE_FEED: 
       color = rgbLed.Color(110, 55, 0); 
       break;
     case ST_STALL_RETRACT: 
@@ -428,14 +431,17 @@ void updateStatusLED() {
 }
 
 // ---------------------------------------------------------------------------
-// Web Endpoints (FIX #7: Optimized String usage)
+// Web Endpoints
 // ---------------------------------------------------------------------------
 void handleData() {
   DynamicJsonDocument doc(2048);
   
   doc["state"] = state;
+  doc["state_name"] = stateToString(state);
   doc["fault"] = faultReason;
   doc["uptime"] = millis() / 1000;
+  doc["cal_mode"] = manualCalMode;
+  doc["cal_motor"] = manualMotorSelect;
   
   doc["f1"] = digitalRead(SENS_F1_PIN) == LOW;
   doc["f2"] = digitalRead(SENS_F2_PIN) == LOW;
@@ -479,21 +485,104 @@ void handleClearFault() {
   server.send(200, "text/plain", "ok"); 
 }
 
-void handleRecalibrate() {
-  if (state == ST_FAULT) { 
-    server.send(409, "text/plain", "clear fault first"); 
-    return; 
+// NEW: Start manual calibration mode
+void handleStartManualCal() {
+  if (server.hasArg("motor")) {
+    int m = server.arg("motor").toInt();
+    if (m == 1 || m == 2) {
+      manualCalMode = true;
+      manualMotorSelect = m;
+      activeMotor = m;
+      motorEnable(m, false);  // Disable motor, allow manual moving
+      char logMsg[64];
+      snprintf(logMsg, sizeof(logMsg), "Ручне калібрування: мотор %d, введи значення вручну", m);
+      addLog(logMsg);
+      state = ST_CAL_MANUAL;
+      server.send(200, "text/plain", "OK");
+    } else {
+      server.send(400, "text/plain", "Invalid motor (1 or 2)");
+    }
+  } else {
+    server.send(400, "text/plain", "Missing motor parameter");
   }
-  prefs.begin("feeder", false);
-  prefs.remove("hallMax"); 
-  prefs.remove("hallEmpty"); 
-  prefs.remove("hallMid");
-  prefs.end();
-  calibrationNeeded = true;
-  activeMotor = 0;
-  state = ST_INIT;
-  addLog("Запит на повторну калібровку буфера");
-  server.send(200, "text/plain", "ok");
+}
+
+// NEW: Set Hall value for EMPTY
+void handleSetHallEmpty() {
+  if (!manualCalMode) {
+    server.send(400, "text/plain", "Not in calibration mode");
+    return;
+  }
+  if (server.hasArg("val")) {
+    hallEmpty = server.arg("val").toInt();
+    char logMsg[64];
+    snprintf(logMsg, sizeof(logMsg), "EMPTY Hall зафіксовано: %d", hallEmpty);
+    addLog(logMsg);
+    server.send(200, "text/plain", "OK");
+  } else {
+    server.send(400, "text/plain", "Missing val parameter");
+  }
+}
+
+// NEW: Set Hall value for MAX
+void handleSetHallMax() {
+  if (!manualCalMode) {
+    server.send(400, "text/plain", "Not in calibration mode");
+    return;
+  }
+  if (server.hasArg("val")) {
+    hallMaxFull = server.arg("val").toInt();
+    char logMsg[64];
+    snprintf(logMsg, sizeof(logMsg), "MAX Hall зафіксовано: %d", hallMaxFull);
+    addLog(logMsg);
+    server.send(200, "text/plain", "OK");
+  } else {
+    server.send(400, "text/plain", "Missing val parameter");
+  }
+}
+
+// NEW: Set Hall value for MID (optional, auto-calculated if not set)
+void handleSetHallMid() {
+  if (!manualCalMode) {
+    server.send(400, "text/plain", "Not in calibration mode");
+    return;
+  }
+  if (server.hasArg("val")) {
+    hallMid = server.arg("val").toInt();
+    char logMsg[64];
+    snprintf(logMsg, sizeof(logMsg), "MID Hall зафіксовано: %d", hallMid);
+    addLog(logMsg);
+    server.send(200, "text/plain", "OK");
+  } else {
+    server.send(400, "text/plain", "Missing val parameter");
+  }
+}
+
+// NEW: Finish manual calibration and save
+void handleFinishCalibration() {
+  if (!manualCalMode) {
+    server.send(400, "text/plain", "Not in calibration mode");
+    return;
+  }
+  
+  // Auto-calculate mid if not set explicitly
+  if (hallMid == 0 || hallMid == 2048) {
+    hallMid = (hallEmpty + hallMaxFull) / 2;
+  }
+  
+  calibrationNeeded = false;
+  manualCalMode = false;
+  saveCalibration();
+  
+  motorHold(manualMotorSelect);
+  motorEnable(manualMotorSelect, true);
+  
+  addLog("Калібрування завершено, переходимо в режим AUTOLOAD");
+  state = ST_AUTOLOAD;
+  
+  char response[128];
+  snprintf(response, sizeof(response), "OK: EMPTY=%d, MID=%d, MAX=%d", hallEmpty, hallMid, hallMaxFull);
+  server.send(200, "text/plain", response);
 }
 
 const char index_html[] PROGMEM = R"rawliteral(
@@ -501,7 +590,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 <html>
 <head>
   <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Feeder Pro</title>
+  <title>Feeder Pro - Manual Calibration</title>
   <style>
     body { font-family: 'Segoe UI', Tahoma, sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 20px; }
     h1 { text-align: center; color: #4CAF50; margin-bottom: 20px; }
@@ -515,18 +604,28 @@ const char index_html[] PROGMEM = R"rawliteral(
     .badge.on { background: #4CAF50; color: #000; }
     .badge.off { background: #555; color: #fff; }
     .badge.warn { background: #ff9800; color: #000; }
+    .badge.cal { background: #2196F3; color: #fff; }
     .btn-wide { width: 100%; padding: 10px; margin-top: 6px; border: none; border-radius: 6px; background: #444; color: #fff; font-weight: bold; cursor: pointer; }
     .btn-danger { background: #ff5252; color: #000; }
+    .btn-success { background: #4CAF50; color: #000; }
+    .btn-info { background: #2196F3; color: #fff; }
     progress { width: 100%; height: 20px; accent-color: #4CAF50; }
     textarea { width: 100%; height: 150px; background: #111; color: #4CAF50; border: 1px solid #333; font-family: monospace; resize: vertical; padding: 8px; box-sizing: border-box; }
     canvas { width: 100%; height: 200px; background: #111; border: 1px solid #333; border-radius: 4px; }
+    .input-group { display: flex; gap: 10px; margin-top: 10px; }
+    .input-group input { flex: 1; padding: 8px; background: #222; border: 1px solid #444; color: #fff; border-radius: 4px; }
+    .input-group button { padding: 8px 15px; background: #2196F3; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+    .cal-section { background: #222; padding: 15px; border-radius: 6px; border-left: 3px solid #2196F3; margin-top: 10px; }
+    .hidden { display: none; }
   </style>
   <script>
-    const states = ['INIT','WAIT_LOAD','CAL_WAIT_EMPTY1','CAL_WAIT_MAX','CAL_WAIT_EMPTY2','AUTOLOAD','RUN','SPLICE_WAIT','SPLICE_FEED','STALL_RETRACT','FAULT'];
-    let chartData = []; const maxPts = 60;
+    const states = ['INIT','WAIT_LOAD','CAL_MANUAL','AUTOLOAD','RUN','SPLICE_WAIT','SPLICE_FEED','STALL_RETRACT','FAULT'];
+    let chartData = []; 
+    const maxPts = 60;
 
     window.onload = () => { fetch('/sync_time?t=' + Math.floor(Date.now()/1000)); };
     function b(v, t, f="Off") { return `<span class="badge ${v?'on':'off'}">${v?t:f}</span>`; }
+    
     function drawChart() {
       const cvs = document.getElementById('chartCvs');
       const ctx = cvs.getContext('2d');
@@ -546,10 +645,38 @@ const char index_html[] PROGMEM = R"rawliteral(
         if(i===0) ctx.moveTo(i*dx, y); else ctx.lineTo(i*dx, y);
       }); ctx.stroke();
     }
+
+    function startCalibration(motor) {
+      fetch(`/start_manual_cal?motor=${motor}`).then(() => location.reload());
+    }
+
+    function setHallEmpty() {
+      const val = prompt('Введи значення Hall для EMPTY:');
+      if (val !== null) fetch(`/set_hall_empty?val=${val}`).then(r => r.text()).then(t => alert(t));
+    }
+
+    function setHallMax() {
+      const val = prompt('Введи значення Hall для MAX:');
+      if (val !== null) fetch(`/set_hall_max?val=${val}`).then(r => r.text()).then(t => alert(t));
+    }
+
+    function setHallMid() {
+      const val = prompt('Введи значення Hall для MID (або залиш пусто для авто):');
+      if (val !== null && val !== '') fetch(`/set_hall_mid?val=${val}`).then(r => r.text()).then(t => alert(t));
+      else alert('MID буде розраховано автоматично');
+    }
+
+    function finishCalibration() {
+      if (confirm('Завершити калібрування і перейти в режим AUTOLOAD?')) {
+        fetch('/finish_calibration').then(r => r.text()).then(t => { alert(t); location.reload(); });
+      }
+    }
+
     setInterval(() => {
       fetch('/data').then(r => r.json()).then(d => {
-        const isF = d.state === 10;
-        document.getElementById('sys_state').innerHTML = `<span class="badge ${isF?'off':'warn'}">${states[d.state]}</span>`;
+        const isF = d.state === 8;
+        const isCalMode = d.cal_mode;
+        document.getElementById('sys_state').innerHTML = `<span class="badge ${isCalMode?'cal':isF?'off':'warn'}">${d.state_name}</span>`;
         document.getElementById('sys_fault').innerText = d.fault || '-';
         document.getElementById('sys_fault').className = d.fault ? 'val fault' : 'val';
 
@@ -567,7 +694,8 @@ const char index_html[] PROGMEM = R"rawliteral(
         pb.max = range;
         pb.value = pos;
         document.getElementById('hall_val').innerText = d.hall_filt;
-        document.getElementById('hall_cal').innerText = `EMPTY: ${d.hall_e} | MAX: ${d.hall_max}`;
+        document.getElementById('hall_raw').innerText = d.hall_raw;
+        document.getElementById('hall_cal').innerText = `EMPTY: ${d.hall_e} | MID: ${d.hall_m} | MAX: ${d.hall_max}`;
 
         const logTA = document.getElementById('sys_log');
         if(logTA.value !== d.log) { logTA.value = d.log; logTA.scrollTop = logTA.scrollHeight; }
@@ -575,19 +703,28 @@ const char index_html[] PROGMEM = R"rawliteral(
         chartData.push({h: d.hall_filt, s: Math.max(d.m1_spd, d.m2_spd)});
         if(chartData.length > maxPts) chartData.shift();
         drawChart();
+
+        // Toggle calibration UI
+        const calUI = document.getElementById('cal_ui');
+        if (isCalMode) {
+          calUI.classList.remove('hidden');
+        } else {
+          calUI.classList.add('hidden');
+        }
       });
     }, 500);
   </script>
 </head>
 <body>
-  <h1>Auto Filament Feeder Pro</h1>
+  <h1>Auto Filament Feeder Pro - Manual Calibration</h1>
   <div class="grid">
     <div class="card">
       <h2>Система</h2>
       <div class="row"><span>Status:</span><span id="sys_state" class="val">-</span></div>
       <div class="row"><span>Fault:</span><span id="sys_fault" class="val">-</span></div>
       <button class="btn-wide btn-danger" onclick="fetch('/clear_fault')">Скинути аварію</button>
-      <button class="btn-wide" onclick="if(confirm('Перекалібрувати буфер? Поточне калібрування буде стерто.')) fetch('/recalibrate')">Перекалібрувати буфер</button>
+      <button class="btn-wide btn-info" onclick="startCalibration(1)">Калібрування Мотор 1</button>
+      <button class="btn-wide btn-info" onclick="startCalibration(2)">Калібрування Мотор 2</button>
       <div class="row" style="margin-top:15px;"><span>Сенсори:</span>
         <div>F1: <span id="sw_f1"></span> | F2: <span id="sw_f2"></span></div>
       </div>
@@ -595,6 +732,21 @@ const char index_html[] PROGMEM = R"rawliteral(
         <div>M1: <span id="m1_act"></span> | M2: <span id="m2_act"></span></div>
       </div>
     </div>
+
+    <div class="card" id="cal_ui" class="hidden">
+      <h2>Ручна калібрування Hall</h2>
+      <div class="cal-section">
+        <p><strong>Current Hall Raw:</strong> <span id="hall_raw" class="val">-</span></p>
+        <p><strong>Current Hall Filtered:</strong> <span id="hall_val" class="val">-</span></p>
+        <div style="margin-top: 15px;">
+          <button class="btn-wide btn-success" onclick="setHallEmpty()">Встанови EMPTY</button>
+          <button class="btn-wide btn-success" onclick="setHallMax()">Встанови MAX</button>
+          <button class="btn-wide btn-success" onclick="setHallMid()">Встанови MID (опційно)</button>
+          <button class="btn-wide btn-info" onclick="finishCalibration()" style="margin-top: 15px;">Завершити калібрування</button>
+        </div>
+      </div>
+    </div>
+
     <div class="card" style="grid-column: 1 / -1;">
       <h2>Буфер (Положення: <span id="hall_val"></span>)</h2>
       <div class="row"><span>Кінцевики:</span>
@@ -602,11 +754,12 @@ const char index_html[] PROGMEM = R"rawliteral(
       </div>
       <progress id="hall_pb" value="0" max="4095"></progress>
       <div class="row" style="font-size:0.85rem; color:#888;">
-        <span>Калібровка:</span><span id="hall_cal">EMPTY: - | MAX: -</span>
+        <span>Калібровка:</span><span id="hall_cal">EMPTY: - | MID: - | MAX: -</span>
       </div>
       <h3 style="margin-bottom:5px; margin-top:15px; font-size:1rem;">Графік (Зелений: Буфер, Синій: Швидкість)</h3>
       <canvas id="chartCvs" width="800" height="200"></canvas>
     </div>
+
     <div class="card" style="grid-column: 1 / -1;">
       <h2>Журнал подій (Лог)</h2>
       <textarea id="sys_log" readonly></textarea>
@@ -698,7 +851,11 @@ void setup() {
   server.on("/data", handleData);
   server.on("/sync_time", handleSyncTime);
   server.on("/clear_fault", handleClearFault);
-  server.on("/recalibrate", handleRecalibrate);
+  server.on("/start_manual_cal", handleStartManualCal);
+  server.on("/set_hall_empty", handleSetHallEmpty);
+  server.on("/set_hall_max", handleSetHallMax);
+  server.on("/set_hall_mid", handleSetHallMid);
+  server.on("/finish_calibration", handleFinishCalibration);
   server.begin();
 
   xTaskCreatePinnedToCore(webTask, "WebServer", 4096, NULL, 1, &webTaskHandle, 0);
@@ -720,9 +877,8 @@ void loop() {
   bool emptySwitch = readDebounced(ENDSTOP_EMPTY_PIN, endstopEmptyState, endstopEmptyChangedAt, endstopEmptyPending);
   bool maxSwitch = readDebounced(ENDSTOP_MAXFULL_PIN, endstopMaxState, endstopMaxChangedAt, endstopMaxPending);
 
-  // FIX #8: Apply moving average before exponential filter
   int hallRaw = readHallAveraging(analogRead(HALL_PIN));
-  if (hallHardwareFaulted(hallRaw) && state != ST_FAULT) { 
+  if (hallHardwareFaulted(hallRaw) && state != ST_FAULT && state != ST_CAL_MANUAL) { 
     enterFault("Відмова датчика Холла"); 
     updateStatusLED(); 
     return; 
@@ -750,9 +906,8 @@ void loop() {
         else { state = ST_WAIT_LOAD; break; } 
       }
       if (calibrationNeeded) {
-        motorEnable(activeMotor, false);
-        addLog("Ручне калібрування: встанови буфер у положення EMPTY");
-        state = ST_CAL_WAIT_EMPTY1;
+        addLog("Система чекає на команду калібрування з веб-інтерфейсу");
+        state = ST_CAL_MANUAL;  // Wait for manual input via web
       } else {
         motorEnable(activeMotor, true); 
         motorHold(activeMotor);
@@ -765,33 +920,10 @@ void loop() {
       else if (f2) { activeMotor = 2; state = ST_INIT; }
       break;
 
-    case ST_CAL_WAIT_EMPTY1:
-      if (emptySwitch) { 
-        addLog("EMPTY зафіксовано, перемісти буфер на MAX"); 
-        state = ST_CAL_WAIT_MAX; 
-      }
-      break;
-
-    case ST_CAL_WAIT_MAX:
-      if (maxSwitch) { 
-        hallMaxFull = hall; 
-        char logMsg[64];
-        snprintf(logMsg, sizeof(logMsg), "MAX зафіксовано: %ld, поверни буфер на EMPTY", hall);
-        addLog(logMsg);
-        state = ST_CAL_WAIT_EMPTY2; 
-      }
-      break;
-
-    case ST_CAL_WAIT_EMPTY2:
-      if (emptySwitch) {
-        hallEmpty = hall;
-        hallMid = (hallEmpty + hallMaxFull) / 2;
-        calibrationNeeded = false;
-        saveCalibration();
-        motorEnable(activeMotor, true); 
-        motorHold(activeMotor);
-        state = ST_AUTOLOAD;
-      }
+    // Manual calibration mode - just wait for web input
+    case ST_CAL_MANUAL:
+      // All calibration happens via web API
+      // Do nothing in main loop, just let the user enter values
       break;
 
     case ST_AUTOLOAD:
@@ -867,7 +999,6 @@ void loop() {
       }
       break;
 
-    // FIX #6: Improved stall retract with timeout
     case ST_STALL_RETRACT: {
       rampMotor(activeMotor, MAX_SPEED_SPS * 0.3f);
       static unsigned long lastUs = 0; 
